@@ -1,0 +1,264 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error
+import nibabel as nib
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+# from nilearn import plotting  # uncomment if you want glass brains
+
+# === CONFIG ===
+DATA_DIR = "./data/"              # put your files here
+FMRI_FILE = DATA_DIR + "sub-001_task-pieman_run-1_bold.nii.gz"
+WORDS_CSV = DATA_DIR + "pieman_all_words.csv"
+TR = 1.5                          # override if header read fails
+TOP_PCT = 0.02
+WIN_TR = 40
+SIGMOID_K = 8.0
+SOFTMAX_TAU = 0.12
+
+# === LOAD ===
+img = nib.load(FMRI_FILE)
+data = img.get_fdata()
+TR = float(img.header.get_zooms()[3]) if TR is None else TR
+Y = data.reshape(-1, data.shape[-1]).T  # (T, V)
+T, V = Y.shape
+vol_shape = data.shape[:3]
+
+# === BUILD X_base ===
+df = pd.read_csv(WORDS_CSV)
+word_col = next(c for c in ["word", "token", "text", "w"] if c in df.columns)
+time_col = next(c for c in ["onset", "start", "start_time", "t", "time", "word_onset"] if c in df.columns)
+words = df[word_col].astype(str).str.strip().tolist()
+onsets_s = df[time_col].astype(float).values
+
+valid = (np.array(words) != "") & np.isfinite(onsets_s) & (onsets_s >= 0)
+words, onsets_s = np.array(words)[valid], onsets_s[valid]
+
+if onsets_s.max() > 1e4: onsets_s /= 1000  # ms → s
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+E = model.encode(words, batch_size=256, show_progress_bar=True)
+
+bins = np.clip((onsets_s / TR).astype(int), 0, T-1)
+X_sum = np.zeros((T, E.shape[1]))
+X_cnt = np.zeros(T, int)
+np.add.at(X_sum, bins, E)
+np.add.at(X_cnt, bins, 1)
+X_base = X_sum / X_cnt[:, None].clip(1)
+
+# === KERNELS ===
+def exp_kernel(tau, TR, n_taus=5):
+    L = max(int(np.ceil(n_taus * tau / TR)), 1)
+    t = np.arange(L) * TR
+    k = np.exp(-t / tau)
+    return k / k.sum()
+
+def temporal_smooth(X, k):
+    out = np.empty_like(X)
+    for j in range(X.shape[1]):
+        out[:, j] = np.convolve(X[:, j], k, mode="full")[:X.shape[0]]
+    return out
+
+k2  = exp_kernel(2,  TR)
+k10 = exp_kernel(10, TR)
+k30 = exp_kernel(30, TR)
+
+X2  = temporal_smooth(X_base, k2)
+X10 = temporal_smooth(X_base, k10)
+X30 = temporal_smooth(X_base, k30)
+Xall = np.hstack([X2, X10, X30])
+
+# === SPLIT + ZSCORE ===
+split = T // 2
+tr, te = slice(0, split), slice(split, T)
+
+X2_tr,  X2_te  = X2[tr],  X2[te]
+X10_tr, X10_te = X10[tr], X10[te]
+X30_tr, X30_te = X30[tr], X30[te]
+Xa_tr,  Xa_te  = Xall[tr], Xall[te]
+Y_tr,   Y_te   = Y[tr],   Y[te]
+
+def zscore_fit(X): return X.mean(0, keepdims=True), X.std(0, keepdims=True).clip(1)
+def zscore_apply(X, mu, sd): return (X - mu) / sd
+
+mu2, sd2 = zscore_fit(X2_tr);   X2_tr_z,  X2_te_z  = zscore_apply(X2_tr, mu2, sd2),  zscore_apply(X2_te, mu2, sd2)
+mu10,sd10= zscore_fit(X10_tr);  X10_tr_z, X10_te_z = zscore_apply(X10_tr,mu10,sd10), zscore_apply(X10_te,mu10,sd10)
+mu30,sd30= zscore_fit(X30_tr);  X30_tr_z, X30_te_z = zscore_apply(X30_tr,mu30,sd30), zscore_apply(X30_te,mu30,sd30)
+mua,sda = zscore_fit(Xa_tr);    Xa_tr_z,  Xa_te_z  = zscore_apply(Xa_tr, mua,sda),   zscore_apply(Xa_te, mua,sda)
+muy,sdy = zscore_fit(Y_tr);     Y_tr_z,   Y_te_z   = zscore_apply(Y_tr, muy,sdy),    zscore_apply(Y_te, muy,sdy)
+
+# === CV ALPHA ===
+alphas = np.logspace(-2, 6, 13)
+kf = KFold(5, shuffle=False)
+
+def pick_alpha(Xtr, Ytr, alphas, kf):
+    best_a, best_loss = None, np.inf
+    for a in alphas:
+        losses = []
+        for tri, vai in kf.split(Xtr):
+            m = Ridge(a, fit_intercept=True).fit(Xtr[tri], Ytr[tri])
+            losses.append(mean_squared_error(Ytr[vai], m.predict(Xtr[vai])))
+        loss = np.mean(losses)
+        if loss < best_loss: best_loss, best_a = loss, a
+    return best_a
+
+alpha2  = pick_alpha(X2_tr_z,  Y_tr_z, alphas, kf)
+alpha10 = pick_alpha(X10_tr_z, Y_tr_z, alphas, kf)
+alpha30 = pick_alpha(X30_tr_z, Y_tr_z, alphas, kf)
+alphaa  = pick_alpha(Xa_tr_z,  Y_tr_z, alphas, kf)
+
+# === OOF COSINE (train) ===
+def oof_cosine(Xtr_z, Ytr_z, alpha, kf):
+    Yhat = np.zeros_like(Ytr_z)
+    for tri, vai in kf.split(Xtr_z):
+        m = Ridge(alpha, fit_intercept=True).fit(Xtr_z[tri], Ytr_z[tri])
+        Yhat[vai] = m.predict(Xtr_z[vai])
+    num = (Ytr_z * Yhat).sum(0)
+    den = np.linalg.norm(Ytr_z, axis=0) * np.linalg.norm(Yhat, axis=0) + 1e-12
+    return num / den
+
+scores_all = oof_cosine(Xa_tr_z, Y_tr_z, alphaa, kf)
+top_vox = np.argsort(scores_all)[-int(TOP_PCT * V):]   # MASTER ROI
+
+# === TEST SCORE ===
+def test_score(Xtr_z, Xte_z, Ytr_z, Yte_z, alpha, vox_idx):
+    m = Ridge(alpha, fit_intercept=True).fit(Xtr_z, Ytr_z)
+    Yhat = m.predict(Xte_z)
+    cs = (Yte_z * Yhat).sum(0) / (np.linalg.norm(Yte_z,0) * np.linalg.norm(Yhat,0) + 1e-12)
+    return cs[vox_idx].mean(), cs[vox_idx].median()
+
+print("MASTER ROI (top 2%) test cosine:")
+for k, Xtr_z, Xte_z, a in [("2s",X2_tr_z,X2_te_z,alpha2), ("10s",X10_tr_z,X10_te_z,alpha10),
+                           ("30s",X30_tr_z,X30_te_z,alpha30), ("all",Xa_tr_z,Xa_te_z,alphaa)]:
+    m, md = test_score(Xtr_z, Xte_z, Y_tr_z, Y_te_z, a, top_vox)
+    print(f"  {k:4}: mean {m:.4f}  median {md:.4f}")
+
+# === SHUFFLE CONTROL (TR-wise perm of X_base → destroys narrative) ===
+np.random.seed(123)
+perm = np.random.permutation(T)
+X_base_shuf = X_base[perm]
+X2_shuf  = temporal_smooth(X_base_shuf, k2)
+X10_shuf = temporal_smooth(X_base_shuf, k10)
+X30_shuf = temporal_smooth(X_base_shuf, k30)
+Xall_shuf = np.hstack([X2_shuf, X10_shuf, X30_shuf])
+
+X2s_tr_z = zscore_apply(X2_shuf[tr],  mu2, sd2)
+X10s_tr_z= zscore_apply(X10_shuf[tr], mu10,sd10)
+X30s_tr_z= zscore_apply(X30_shuf[tr], mu30,sd30)
+Xas_tr_z = zscore_apply(Xall_shuf[tr],mua,sda)
+
+X2s_te_z = zscore_apply(X2_shuf[te],  mu2, sd2)
+X10s_te_z= zscore_apply(X10_shuf[te], mu10,sd10)
+X30s_te_z= zscore_apply(X30_shuf[te], mu30,sd30)
+Xas_te_z = zscore_apply(Xall_shuf[te],mua,sda)
+
+m2s, _ = test_score(X2s_tr_z, X2s_te_z, Y_tr_z, Y_te_z, alpha2, top_vox)
+m10s,_ = test_score(X10s_tr_z,X10s_te_z,Y_tr_z,Y_te_z,alpha10,top_vox)
+m30s,_ = test_score(X30s_tr_z,X30s_te_z,Y_tr_z,Y_te_z,alpha30,top_vox)
+mas, _ = test_score(Xas_tr_z, Xas_te_z, Y_tr_z, Y_te_z, alphaa, top_vox)
+
+plt.figure(figsize=(5,4))
+plt.bar(["2s","10s","30s","all"], [m2,m10,m30,ma], color=["#d62728","#9467bd","#1f77b4","#7f7f7f"])
+plt.bar(["2s","10s","30s","all"], [m2s,m10s,m30s,mas], color="gray", alpha=0.4, hatch="//", label="shuffle")
+plt.ylabel("Held-out cosine (master ROI)")
+plt.title("Real vs TR-shuffled control")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# === SCALE SPECIALIZATION (uncomment nilearn for glass) ===
+roi2_idx  = np.argsort(oof_cosine(X2_tr_z,  Y_tr_z, alpha2,  kf))[-int(TOP_PCT*V):]
+roi10_idx = np.argsort(oof_cosine(X10_tr_z, Y_tr_z, alpha10, kf))[-int(TOP_PCT*V):]
+roi30_idx = np.argsort(oof_cosine(X30_tr_z, Y_tr_z, alpha30, kf))[-int(TOP_PCT*V):]
+
+def eval_roi(idx):
+    return [test_score(*args, idx)[0] for args in [
+        (X2_tr_z, X2_te_z, Y_tr_z, Y_te_z, alpha2),
+        (X10_tr_z,X10_te_z,Y_tr_z,Y_te_z,alpha10),
+        (X30_tr_z,X30_te_z,Y_tr_z,Y_te_z,alpha30),
+        (Xa_tr_z, Xa_te_z, Y_tr_z, Y_te_z, alphaa)]]
+
+R = np.vstack([eval_roi(top_vox), eval_roi(roi2_idx), eval_roi(roi10_idx), eval_roi(roi30_idx)])
+
+labels_roi = ["Master", "ROI-2s", "ROI-10s", "ROI-30s"]
+colors = ["#d62728","#9467bd","#1f77b4","#7f7f7f"]
+x = np.arange(len(labels_roi))
+w = 0.18
+
+plt.figure(figsize=(8,5))
+for j, c in enumerate(colors):
+    offs = (j - 1.5) * w
+    if j == 3:
+        plt.bar(x[0] + offs, R[0,j], w, color=c, edgecolor="k", lw=2, zorder=10)
+    plt.bar(x + offs, R[:,j], w, color=c, zorder=5)
+
+plt.xticks(x, labels_roi)
+plt.ylabel("Held-out cosine")
+plt.title("Scale specialization across ROIs")
+plt.legend([plt.Rectangle((0,0),1,1,color=c) for c in colors], ["2s","10s","30s","All"])
+plt.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# === GLASS BRAINS (uncomment + pip install nilearn) ===
+# def vol_from_idx(idx):
+#     vol = np.zeros(vol_shape)
+#     vol.flat[idx] = 1
+#     return nib.Nifti1Image(vol, img.affine)
+#
+# plotting.plot_glass_brain(vol_from_idx(roi2_idx),  cmap="Reds",    title="2s")
+# plotting.plot_glass_brain(vol_from_idx(roi10_idx), cmap="Purples", title="10s")
+# plotting.plot_glass_brain(vol_from_idx(roi30_idx), cmap="Blues",   title="30s")
+# plotting.plot_glass_brain(vol_from_idx(top_vox),   cmap="Greys",   title="All")
+# plt.show()
+
+# === DYNAMIC ===
+mdl2  = Ridge(alpha2).fit(X2_tr_z,  Y_tr_z);  Yh2 = mdl2.predict(X2_te_z)
+mdl10 = Ridge(alpha10).fit(X10_tr_z, Y_tr_z); Yh10= mdl10.predict(X10_te_z)
+mdl30 = Ridge(alpha30).fit(X30_tr_z, Y_tr_z); Yh30= mdl30.predict(X30_te_z)
+
+def corr_1d(a,b): return np.corrcoef(a,b)[0,1]
+r2_v  = [corr_1d(Y_te_z[:,v], Yh2[:,v])  for v in range(V)]
+r10_v = [corr_1d(Y_te_z[:,v], Yh10[:,v]) for v in range(V)]
+r30_v = [corr_1d(Y_te_z[:,v], Yh30[:,v]) for v in range(V)]
+rbest = np.maximum.reduce([r2_v, r10_v, r30_v])
+dyn_idx = np.argsort(rbest)[-int(TOP_PCT*V):]
+
+y_true = Y_te_z[:,dyn_idx].mean(1)
+y2     = Yh2[:,dyn_idx].mean(1)
+y10    = Yh10[:,dyn_idx].mean(1)
+y30    = Yh30[:,dyn_idx].mean(1)
+
+def rolling_corr(x,y,win):
+    n = len(x); res = np.full(n,np.nan)
+    for i in range(win//2, n-win//2):
+        a,b = x[i-win//2:i+win//2+1], y[i-win//2:i+win//2+1]
+        res[i] = corr_1d(a,b)
+    return res
+
+r2_t  = rolling_corr(y_true,y2, WIN_TR)
+r10_t = rolling_corr(y_true,y10,WIN_TR)
+r30_t = rolling_corr(y_true,y30,WIN_TR)
+
+def sigmoid(x,k=SIGMOID_K): return 1/(1+np.exp(-k*x))
+def softmax_rows(M,tau=SOFTMAX_TAU):
+    Z = (M / tau) - np.nanmax(M/tau,1,keepdims=True)
+    E = np.exp(Z)
+    return E / E.sum(1,keepdims=True)
+
+P = softmax_rows(sigmoid(np.stack([r2_t,r10_t,r30_t],1)))
+
+t = np.arange(split,T) * TR
+plt.figure(figsize=(12,3))
+plt.plot(t, P[:,0], "#d62728", lw=4, label="2s")
+plt.plot(t, P[:,1], "#9467bd", lw=4, label="10s")
+plt.plot(t, P[:,2], "#1f77b4", lw=4, label="30s")
+plt.ylim(0,1)
+plt.xlim(t[WIN_TR//2], t[-WIN_TR//2-1])
+plt.xlabel("time (s)"); plt.ylabel("prob")
+plt.title("Dynamic timescale weights (master ROI, test half)")
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.show()
