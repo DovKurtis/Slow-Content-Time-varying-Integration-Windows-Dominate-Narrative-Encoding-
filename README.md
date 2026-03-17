@@ -1,4 +1,4 @@
-# Slow-Content-Time-varying-Integration-Windows-Dominate-Narrative-Encoding-
+# Time-varying-Integration-Windows-Dominate-Narrative-Encoding-
 
 Long-Term Goal: Develop hyper-dynamic, hyper-individualized encoding models trained on continuous, real-world multimodal data (visual, auditory, physiological, neural) to help shift neural decoding from controlled experiments to more natural sensory experience and life history. 
 
